@@ -1,0 +1,17 @@
+streamlit
+pandas
+openpyxl
+requests
+beautifulsoup4
+lxml
+playwright
+pycountry
+tqdm
+deep-translator
+unidecode
+streamlit-aggrid
+babel
+googletrans
+forex_python
+
+
