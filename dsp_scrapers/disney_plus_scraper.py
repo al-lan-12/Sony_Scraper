@@ -9,6 +9,9 @@ Disney+ Prices — Multilingual scraper with robust navigation & per-price expan
 + Türkiye/TR/TRY handled
 + Safer page-currency sniffing (only trusts repeated explicit ISO-3 on page)
 + **Fix:** United States no longer maps to United Kingdom (ISO-aware selection; no dropping 'states/kingdom')
++ Patch: year filter works; 3-decimal currencies (KWD/BHD/OMR/...); expanded REGION_TO_CURRENCY;
+  non-Latin/Basic plan tiers (no silent 'Standard' default); ISO-3 sniffing only near numbers;
+  picker discovery exits early; real retry URL; main() reports failure; cached fuzzy lookups.
 
 Output columns:
     country_name, country_iso2, locale_used, url,
@@ -22,7 +25,10 @@ import os
 import re
 import json
 import time
+import asyncio
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from difflib import SequenceMatcher
@@ -64,9 +70,11 @@ except Exception:
     _RF = False
 
 # ---------------------- SAVE EXCEL ----------------------
-def save_excel_robust(df: pd.DataFrame, out_path: Path):
-    """Save to Excel; try default engine, then specific engines, then CSV fallback."""
+def save_excel_robust(df: pd.DataFrame, out_path: Path) -> Path:
+    """Save to Excel; try default engine, then specific engines, then CSV fallback.
+    Returns the path that was actually written."""
     out_path = out_path.resolve()
+    last_err: Optional[Exception] = None
 
     def _try_save_excel(path: Path, engine: Optional[str] = None):
         if engine:
@@ -77,13 +85,13 @@ def save_excel_robust(df: pd.DataFrame, out_path: Path):
     try:
         _try_save_excel(out_path, None)
         print(f"Saved Excel -> {out_path}")
-        return
+        return out_path
     except PermissionError:
         ts_path = out_path.with_name(f"{out_path.stem}_{int(time.time())}{out_path.suffix}")
         try:
             _try_save_excel(ts_path, None)
             print(f"[WARN] Original Excel was locked. Saved copy -> {ts_path}")
-            return
+            return ts_path
         except Exception as e:
             last_err = e
     except Exception as e:
@@ -94,7 +102,7 @@ def save_excel_robust(df: pd.DataFrame, out_path: Path):
         try:
             _try_save_excel(out_path, eng)
             print(f"Saved Excel -> {out_path} (engine={eng})")
-            return
+            return out_path
         except Exception as e:
             tried.append((eng, f"{e.__class__.__name__}: {e}"))
 
@@ -103,10 +111,12 @@ def save_excel_robust(df: pd.DataFrame, out_path: Path):
         df.to_csv(csv_path, index=False, encoding="utf-8-sig")
         msg = "; ".join([f"{eng} failed ({err})" for eng, err in tried]) or repr(last_err)
         print(f"[WARN] Excel save failed ({msg}). Saved CSV fallback -> {csv_path}")
+        return csv_path
     except Exception as e2:
         alt_path = out_path.with_name(out_path.stem + f"_{int(time.time())}.csv")
         df.to_csv(alt_path, index=False, encoding="utf-8-sig")
         print(f"[WARN] Excel & CSV encountered issues ({e2}). Wrote -> {alt_path}")
+        return alt_path
 
 # ---------------------- FUZZY HELPERS ----------------------
 # IMPORTANT: do NOT drop 'state(s)' or 'kingdom' – keeps 'United States' vs 'United Kingdom' distinct.
@@ -115,6 +125,7 @@ _WORDS_TO_DROP = {
     "people","commonwealth","union","arab","emirates","islamic","plurinational"
     # 'kingdom','state','states' intentionally omitted
 }
+@lru_cache(maxsize=None)
 def _norm_for_match(s: str) -> str:
     s = unidecode((s or "")).lower()
     # Normalize Saint/Sainte & abbreviations (st., st, ste., ste)
@@ -165,6 +176,21 @@ try:
 except Exception:
     ISO_CODES = set()
 
+# ISO-4217 codes that are also ordinary English words; never trusted from text
+# (region mapping still resolves e.g. Albania -> ALL).
+_ISO3_AMBIGUOUS = {"ALL", "TOP", "PEN", "SOS", "CUP", "MOP"}
+
+# An ISO-3 code only counts as an explicit currency if it sits right next to a digit.
+_ISO3_NEAR_NUM_RE = re.compile(r"\b([A-Z]{3})\s?\d|\d\s?([A-Z]{3})\b")
+
+def _iso3_hits_near_numbers(text: str) -> List[str]:
+    hits: List[str] = []
+    for m in _ISO3_NEAR_NUM_RE.finditer(text or ""):
+        code = (m.group(1) or m.group(2) or "").upper()
+        if code in ISO_CODES and code not in _ISO3_AMBIGUOUS:
+            hits.append(code)
+    return hits
+
 # Currency symbols we consider as "strong" tokens.
 # NOTE: we intentionally EXCLUDE plain 'R' (too ambiguous) and rely on region (ZA) instead.
 CURRENCY_SYMBOLS = {
@@ -190,8 +216,17 @@ def _strip_space_seps(s: str) -> str:
     return (s.replace(" ", "").replace("\u00A0","").replace("\u202F","")
              .replace("’","").replace("'",""))
 
-def parse_number_locale_agnostic(num_str: str) -> Optional[float]:
+THREE_DECIMAL_CCY = {"BHD", "KWD", "OMR", "JOD", "TND", "LYD"}
+
+def parse_number_locale_agnostic(num_str: str, three_decimal: bool = False) -> Optional[float]:
     s = num_str.strip().replace("\u202F", " ").replace("\u00A0", " ").replace("’", "'")
+    if three_decimal:
+        # e.g. KWD "1.500" means 1.5, not 1500 (last separator + exactly 3 digits = decimals)
+        m3 = re.fullmatch(r"(.*?)([.,])(\d{3})", s)
+        if m3 and s.count(m3.group(2)) == 1:
+            head = re.sub(r"[ .,']", "", m3.group(1))
+            if head.isdigit():
+                return float(f"{int(head)}.{m3.group(3)}")
     has_dot, has_com = "." in s, "," in s
     if has_dot and has_com:
         last_dot, last_com = s.rfind("."), s.rfind(",")
@@ -240,7 +275,7 @@ def _scan_currency_tokens(text: str) -> List[Tuple[str, int, int]]:
     # 3-letter ISO codes (strong)
     for m in re.finditer(r"\b([A-Z]{3})\b", text):
         code = m.group(1).upper()
-        if code in ISO_CODES:
+        if code in ISO_CODES and code not in _ISO3_AMBIGUOUS:
             tokens.append((code, m.start(), m.end()))
     # prefixed like US$, AU$, HK$, R$, NT$, etc.
     for m in re.finditer(r"\b([A-Z]{1,3}\$)\b", text):
@@ -308,7 +343,7 @@ def detect_period_from_context(text: str, start: int, end: int) -> str:
 REGION_TO_CURRENCY = {
     "US":"USD","GB":"GBP","IE":"EUR","DE":"EUR","FR":"EUR","ES":"EUR","IT":"EUR","NL":"EUR","PT":"EUR","BE":"EUR",
     "AT":"EUR","FI":"EUR","EE":"EUR","LV":"EUR","LT":"EUR","SK":"EUR","SI":"EUR","GR":"EUR","CY":"EUR","MT":"EUR",
-    "PL":"PLN","CZ":"CZK","HU":"HUF","RO":"RON","BG":"BGN","HR":"EUR",
+    "PL":"PLN","CZ":"CZK","HU":"HUF","RO":"RON","BG":"EUR","HR":"EUR",  # BG: euro since 1 Jan 2026 (verify against live prices)
     "SE":"SEK","DK":"DKK","NO":"NOK","IS":"ISK",
     "CH":"CHF",
     "JP":"JPY","KR":"KRW","TW":"TWD","HK":"HKD","SG":"SGD","MY":"MYR","ID":"IDR","PH":"PHP","TH":"THB","VN":"VND",
@@ -319,7 +354,15 @@ REGION_TO_CURRENCY = {
     "ZA":"ZAR","NG":"NGN","KE":"KES","GH":"GHS","TZ":"TZS","UG":"UGX","CI":"XOF","SN":"XOF","CM":"XAF",
     # Caribbean additions (esp. for Saint Lucia)
     "TT":"TTD","BB":"BBD","BS":"BSD","JM":"JMD",
-    "LC":"XCD","VC":"XCD","GD":"XCD","DM":"XCD","AG":"XCD","AI":"XCD","KN":"XCD","MS":"XCD"
+    "LC":"XCD","VC":"XCD","GD":"XCD","DM":"XCD","AG":"XCD","AI":"XCD","KN":"XCD","MS":"XCD",
+    # Added: euro-area microstates, Balkans, Eastern Europe, Caucasus
+    "LU":"EUR","MC":"EUR","AD":"EUR","SM":"EUR","VA":"EUR","ME":"EUR","XK":"EUR",
+    "BA":"BAM","RS":"RSD","AL":"ALL","MK":"MKD","MD":"MDL","UA":"UAH","GE":"GEL","AM":"AMD","AZ":"AZN","KZ":"KZT",
+    # Added: Latin America & Caribbean
+    "EC":"USD","PA":"USD","SV":"USD","PR":"USD","CR":"CRC","GT":"GTQ","HN":"HNL","NI":"NIO","DO":"DOP","PY":"PYG",
+    "HT":"HTG","BM":"BMD","KY":"KYD","AW":"AWG","CW":"ANG","SX":"ANG","BZ":"BZD","GY":"GYD","SR":"SRD",
+    # Added: Middle East / Africa / Oceania
+    "JO":"JOD","LB":"LBP","TN":"TND","DZ":"DZD","FJ":"FJD","PG":"PGK",
 }
 
 # --------- Page currency inference (safe) ----------
@@ -333,7 +376,7 @@ def infer_page_currency(html_text: str,
     if not html_text:
         return default
 
-    iso_hits = [m.group(1).upper() for m in re.finditer(r"\b([A-Z]{3})\b", html_text) if m.group(1).upper() in ISO_CODES]
+    iso_hits = _iso3_hits_near_numbers(html_text)
     if iso_hits:
         counts = Counter(iso_hits)
         if len(counts) == 1 and next(iter(counts.values())) >= 2:
@@ -345,8 +388,6 @@ def extract_all_prices(text: str,
     out = []
     for m in PRICE_NUMBER_RE.finditer(text):
         raw_num = m.group(0)
-        val = parse_number_locale_agnostic(raw_num)
-        if val is None: continue
         near_cur = _nearest_currency_around(text, m.start(), m.end())
         has_tight_currency = False
         tok_clean = None
@@ -355,21 +396,30 @@ def extract_all_prices(text: str,
             if (tok.upper() in ISO_CODES) or _is_currency_symbol(tok[:1]) or re.fullmatch(r"[A-Z]{1,3}\$", tok):
                 tok_clean = tok
             has_tight_currency = (near_cur[1] <= 3)
-        is_year_like = False
-        try:
-            iv = int(str(val)); is_year_like = (float(iv) == val and 1900 <= iv <= 2100)
-        except: pass
+        cur = tok_clean.strip() if tok_clean else (page_currency_hint or None)
+        cur_code = cur.upper() if cur else None
+        val = parse_number_locale_agnostic(raw_num, three_decimal=(cur_code in THREE_DECIMAL_CCY))
+        if val is None: continue
+        # val is a float, so compare against int(val) (the old int(str(val)) always raised)
+        iv = int(val)
+        is_year_like = (val == iv and 1900 <= iv <= 2100)
         if is_year_like and not has_tight_currency:
             continue
-        cur = tok_clean.strip() if tok_clean else (page_currency_hint or None)
         out.append((val, cur, m.start(), m.end()))
     return out
 
 # ---------------------- SMART ENGLISH NAMING ----------------------
+# Latin/Cyrillic patterns are matched against the unidecode()'d text (so 'prémium', 'премиум' -> 'premium').
 TIER_PATTERNS = {
-    "Premium": re.compile(r"\b(premium|premiun|pr[eé]mium|prämiu?m|премиум|プレミアム|高级|高級)\b"),
-    "Standard": re.compile(r"\b(standard|estandar|est[aá]ndar|standardowy|στάνταρ|スタンダード)\b"),
+    "Premium": re.compile(r"\b(premium|premiun)\b"),
+    "Standard": re.compile(r"\b(standard|estandar|standardowy)\b"),
+    "Basic": re.compile(r"\b(basic|basico|basique|essential)\b"),
     "Extra Member": re.compile(r"\b(extra\s+member|miembro\s+extra|membre\s+extra|membro\s+extra)\b"),
+}
+# CJK/Greek terms are matched on the raw lower-cased text, because unidecode() mangles them.
+NONLATIN_TIER_TERMS = {
+    "Premium": ("премиум", "プレミアム", "高级", "高級"),
+    "Standard": ("στάνταρ", "スタンダード", "标准", "標準"),
 }
 ADS_WITH_RE  = re.compile(r"(with\s+ads|con\s+anuncios|mit\s+werbung|avec\s+(pub|publicit[eé]s?)|con\s+pubblicit[aà]|com\s+an[uú]ncios|z\s+reklam)", re.I)
 ADS_WITHOUT_RE = re.compile(r"(without\s+ads|no\s+ads|sin\s+anuncios|ohne\s+werbung|sans\s+(pub|publicit[eé]s?)|senza\s+pubblicit[aà]|sem\s+an[uú]ncios|bez\s+reklam)", re.I)
@@ -377,12 +427,13 @@ ADS_WITHOUT_RE = re.compile(r"(without\s+ads|no\s+ads|sin\s+anuncios|ohne\s+werb
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", unidecode((s or "").strip()).lower())
 
-def detect_tier_english(plan_raw: str) -> str:
+def detect_tier_english(plan_raw: str) -> Optional[str]:
     n = _norm(plan_raw)
+    raw = (plan_raw or "").lower()
     for tier, pat in TIER_PATTERNS.items():
-        if pat.search(n):
+        if pat.search(n) or any(t in raw for t in NONLATIN_TIER_TERMS.get(tier, ())):
             return tier
-    return "Standard"
+    return None  # unknown tier: don't guess
 
 def detect_ads_flag(*texts: str) -> Optional[str]:
     blob = " ".join([t for t in texts if t]).strip()
@@ -396,12 +447,11 @@ def detect_ads_flag(*texts: str) -> Optional[str]:
 
 def canonical_plan_english(plan_raw: str, price_text_full: str, price_text_fragment: str) -> str:
     tier = detect_tier_english(plan_raw)
-    ads = detect_ads_flag(plan_raw, price_text_full, price_text_fragment) or "Unspecified"
-    if ads == "With Ads":
-        return f"Disney+ {tier} With Ads"
-    if ads == "Without Ads":
-        return f"Disney+ {tier} Without Ads"
-    return f"Disney+ {tier}"
+    ads = detect_ads_flag(plan_raw, price_text_full, price_text_fragment)
+    name = "Disney+" + (f" {tier}" if tier else "")
+    if ads:
+        name += f" {ads}"
+    return name
 
 def _is_english_locale(loc: Optional[str]) -> bool:
     return str(loc or "").lower().startswith("en-")
@@ -560,10 +610,11 @@ def discover_pickers(page: Page):
             page.keyboard.press("Escape")
             if not texts: continue
             if (not country_btn) and (len(texts) > 40 or any("Afghanistan" in t for t in texts)):
-                country_btn = trig; country_list = list(dict.fromkeys(texts)); continue
-            if (not language_btn) and any("English" in t for t in texts):
-                language_btn = trig; continue
-            if country_btn and language_btn: break
+                country_btn = trig; country_list = list(dict.fromkeys(texts))
+            elif (not language_btn) and any("English" in t for t in texts):
+                language_btn = trig
+            if country_btn and language_btn:
+                break
         except Exception:
             try: page.keyboard.press("Escape")
             except: pass
@@ -701,6 +752,8 @@ CURRENCY_MAP = {
     "ДЕН":"MKD","ден":"MKD","ден.":"MKD",
     # 'R' intentionally omitted (ambiguous) – resolved by ZA region only
 }
+# Lookups use cur_raw.upper(), so normalise keys too (lower-case Cyrillic keys were unreachable).
+CURRENCY_MAP = {k.upper(): v for k, v in CURRENCY_MAP.items()}
 
 SPECIAL_COUNTRY_ALIASES = {
     "UK": "GB",
@@ -760,6 +813,7 @@ for c in pycountry.countries:
 for alias, iso2 in [(k, v) for k, v in SPECIAL_COUNTRY_ALIASES.items()]:
     _COUNTRY_CHOICES.append((iso2, alias))
 
+@lru_cache(maxsize=8192)
 def country_to_iso2_fuzzy(name: str, cutoff: int = 88) -> str:
     """Return ISO-2 for a (possibly messy) country label; keeps original on failure."""
     if not name:
@@ -804,11 +858,8 @@ def normalize_currency_iso3(cur_val: Optional[str],
       4) last resort -> country map
     """
     def _find_iso3_in_text(txt: str) -> Optional[str]:
-        for m in re.finditer(r"\b([A-Z]{3})\b", txt or ""):
-            code = m.group(1).upper()
-            if code in ISO_CODES:
-                return code
-        return None
+        hits = _iso3_hits_near_numbers(txt or "")
+        return hits[0] if hits else None
 
     iso_from_text = _find_iso3_in_text(price_text_fragment or "") or _find_iso3_in_text(price_text_full or "")
     if iso_from_text:
@@ -848,7 +899,8 @@ def normalize_currency_iso3(cur_val: Optional[str],
         return REGION_TO_CURRENCY.get(region, None)
 
 # ---------------------- MAIN ----------------------
-def main():
+def main() -> Optional[Path]:
+    """Run the scrape. Returns the path actually written, or None if nothing was produced."""
     raw_rows: List[Dict] = []
 
     with sync_playwright() as p:
@@ -935,10 +987,14 @@ def main():
                     lang_attr = "en-GB"
 
                 price_url = f"https://help.disneyplus.com/{lang_attr}/article/disneyplus-price"
-                if not goto_relaxed(page, price_url, timeout_ms=20000):
-                    alt_url = START_URL.replace("en-GB", lang_attr)
-                    if not goto_relaxed(page, alt_url, timeout_ms=20000):
-                        print("  [timeout] navigation failed, skipping"); continue
+                nav_ok = goto_relaxed(page, price_url, timeout_ms=20000)
+                if not nav_ok:
+                    # Retry with the bare language code (e.g. "en") - only if it is a different URL.
+                    alt_url = f"https://help.disneyplus.com/{lang_attr.split('-')[0]}/article/disneyplus-price"
+                    if alt_url != price_url:
+                        nav_ok = goto_relaxed(page, alt_url, timeout_ms=20000)
+                if not nav_ok:
+                    print("  [timeout] navigation failed, skipping"); continue
 
                 html = page.evaluate("document.body.innerHTML")
                 rows = parse_article_html(html)
@@ -1041,15 +1097,26 @@ def main():
         print(mism[["country_name","country_iso2","currency_iso3","_expected_by_country","price_text_fragment"]].head(20).to_string(index=False))
     df = df.drop(columns=["_expected_by_country"])
 
-    save_excel_robust(df, EXCEL_PATH)
+    saved_path = save_excel_robust(df, EXCEL_PATH)
 
     if SAVE_JSON:
         JSON_PATH.write_text(json.dumps(df.to_dict(orient="records"), indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"Saved JSON (enriched) -> {JSON_PATH.resolve()}")
 
-    print(f"\nExcel written to: {EXCEL_PATH.resolve()}")
+    print(f"\nOutput written to: {saved_path.resolve()}")
     print("\nSample rows:")
     print(df.head(12))
+    return saved_path
+
+def _run_main_safely() -> Optional[Path]:
+    """Playwright's sync API refuses to run inside a live asyncio loop (e.g. FastAPI/async
+    handlers). If a loop is running in this thread, execute main() in a worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return main()
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(main).result()
 
 def run_disney_scraper(mode: str = "full", test_countries=None) -> str:
     """Wrapper used by the web app.
@@ -1066,9 +1133,12 @@ def run_disney_scraper(mode: str = "full", test_countries=None) -> str:
     MODE = mode  # "test" or "full"
     SELECTED_ISO2 = [c.upper() for c in (test_countries or [])]
 
-    main()  # this will write to EXCEL_PATH
-
-    return str(EXCEL_PATH.resolve())
+    saved = _run_main_safely()
+    if not saved:
+        raise RuntimeError(
+            "Disney+ scrape produced no data (see console output and the disney_debug/ screenshots)."
+        )
+    return str(Path(saved).resolve())
 
 
 if __name__ == "__main__":
