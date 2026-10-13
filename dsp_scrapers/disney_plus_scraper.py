@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Disney+ Prices — Multilingual scraper with robust navigation & per-price expansion
 + Deterministic English plan naming (multilingual regex)
@@ -579,73 +580,50 @@ def scroll_to_footer(page: Page):
     page.wait_for_timeout(400)
 
 def discover_pickers(page: Page):
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except Exception:
-        pass
     scroll_to_footer(page)
-    page.wait_for_timeout(1500)
-
-    # Always dump what the browser actually sees, for debugging
-    try:
-        (OUTDIR / "page_dump.html").write_text(page.content(), encoding="utf-8")
-        page.screenshot(path=str(OUTDIR / "pickers_page.png"), full_page=True)
-        print(f"  [debug] title={page.title()!r} url={page.url}")
-    except Exception:
-        pass
-
-    specific = "button[aria-haspopup='listbox'], [role='combobox'], [aria-haspopup='listbox']"
-    broad = "button, [role='button'], select, a[role='button']"
-
+    candidates = page.locator("button[aria-haspopup='listbox'], [role='combobox']")
+    if candidates.count() == 0:
+        candidates = page.locator("button, [role='button']")
     country_btn = language_btn = None
     country_list: List[str] = []
 
-    for selector in (specific, broad):   # fall back whenever the first pass doesn't find both
-        candidates = page.locator(selector)
-        n = candidates.count()
-        print(f"  [info] probing {n} candidates for selector: {selector[:40]}…")
-        for i in range(min(80, n)):
-            trig = candidates.nth(i)
-            try:
-                if not trig.is_visible():
-                    continue
-                trig.scroll_into_view_if_needed()
-                trig.click(timeout=2000)
-                lb = page.get_by_role("listbox")
-                for _ in range(20):
-                    if lb.count() and lb.locator("[role='option'], li").count() > 0:
-                        break
-                    page.wait_for_timeout(150)
-                opts = lb.locator("[role='option'], li, .slds-listbox__option, [data-value]")
-                texts = []
-                for el in opts.all():
-                    try:
-                        t = re.sub(r"\s+", " ", el.inner_text().strip())
-                        if t and "Selected" not in t:
-                            texts.append(t)
-                    except Exception:
-                        pass
-                page.keyboard.press("Escape")
-                if not texts:
-                    continue
-                if (not country_btn) and (len(texts) > 40 or any("Afghanistan" in t for t in texts)):
-                    country_btn = trig
-                    country_list = list(dict.fromkeys(texts))
-                elif (not language_btn) and any("English" in t for t in texts):
-                    language_btn = trig
-                if country_btn and language_btn:
-                    return country_btn, language_btn, country_list
-            except Exception:
-                try: page.keyboard.press("Escape")
-                except Exception: pass
-        if country_btn and language_btn:
-            break
+    print(f"  [info] probing {candidates.count()} candidate pickers…")
+    for i in range(min(60, candidates.count())):
+        trig = candidates.nth(i)
+        try:
+            trig.scroll_into_view_if_needed()
+            trig.click()
+            lb = page.get_by_role("listbox")
+            for _ in range(30):
+                if lb.count() and lb.locator("[role='option'], li").count() > 0:
+                    break
+                page.wait_for_timeout(150)
+            opts = lb.locator("[role='option'], li, .slds-listbox__option, [data-value]")
+            texts = []
+            for el in opts.all():
+                try:
+                    t = re.sub(r"\s+", " ", el.inner_text().strip())
+                    if t and "Selected" not in t:
+                        texts.append(t)
+                except Exception:
+                    pass
+            page.keyboard.press("Escape")
+            if not texts: continue
+            if (not country_btn) and (len(texts) > 40 or any("Afghanistan" in t for t in texts)):
+                country_btn = trig; country_list = list(dict.fromkeys(texts))
+            elif (not language_btn) and any("English" in t for t in texts):
+                language_btn = trig
+            if country_btn and language_btn:
+                break
+        except Exception:
+            try: page.keyboard.press("Escape")
+            except: pass
+            continue
 
     if not country_btn or not language_btn:
-        raise RuntimeError(
-            f"Could not find country/language pickers (country={bool(country_btn)}, "
-            f"language={bool(language_btn)}). See disney_debug/page_dump.html"
-        )
+        page.screenshot(path=str(OUTDIR / "could_not_find_pickers.png"))
+        raise RuntimeError("Could not find country/language pickers")
+
     return country_btn, language_btn, country_list
 
 def select_from_list_by_normalized_text(page: Page, trigger: Locator, target_label: str) -> Tuple[bool, Optional[str]]:
