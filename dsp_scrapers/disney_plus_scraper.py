@@ -12,6 +12,9 @@ Disney+ Prices — Multilingual scraper with robust navigation & per-price expan
 + Patch: year filter works; 3-decimal currencies (KWD/BHD/OMR/...); expanded REGION_TO_CURRENCY;
   non-Latin/Basic plan tiers (no silent 'Standard' default); ISO-3 sniffing only near numbers;
   picker discovery exits early; real retry URL; main() reports failure; cached fuzzy lookups.
++ Picker fix: the picker is a COMBINED list of 'Country (Language)' options. The list is scrolled to the end
+  to collect every option, one variant per country is chosen (English preferred), and the option is
+  selected by its exact label. The separate language step is gone.
 
 Output columns:
     country_name, country_iso2, locale_used, url,
@@ -545,6 +548,7 @@ def parse_article_html(html: str) -> List[Dict]:
 def close_cookies(page: Page):
     for sel in [
         'button:has-text("Accept All")',
+        'button:has-text("Accept")',
         '#onetrust-accept-btn-handler',
         'button[aria-label="Accept All"]',
         'text="Accept All"'
@@ -580,6 +584,8 @@ def scroll_to_footer(page: Page):
     page.wait_for_timeout(400)
 
 def discover_pickers(page: Page):
+    """Find the country picker (a combined 'Country (Language)' listbox).
+    Returns (country_btn, language_btn_or_None, first_visible_options)."""
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
@@ -601,10 +607,10 @@ def discover_pickers(page: Page):
     country_btn = language_btn = None
     country_list: List[str] = []
 
-    for selector in (specific, broad):   # fall back whenever the first pass doesn't find both
+    for selector in (specific, broad):   # fall back whenever the first pass finds nothing usable
         candidates = page.locator(selector)
         n = candidates.count()
-        print(f"  [info] probing {n} candidates for selector: {selector[:40]}…")
+        print(f"  [info] probing {n} candidates for selector: {selector[:40]}...")
         for i in range(min(80, n)):
             trig = candidates.nth(i)
             try:
@@ -629,25 +635,22 @@ def discover_pickers(page: Page):
                 page.keyboard.press("Escape")
                 if not texts:
                     continue
-                if (not country_btn) and (len(texts) > 40 or any("Afghanistan" in t for t in texts)):
+                if (not country_btn) and (len(texts) > 40 or any("Afghanistan" in t for t in texts)
+                                          or any("(English)" in t for t in texts)):
                     country_btn = trig
                     country_list = list(dict.fromkeys(texts))
+                    # The list is combined (country + language), so the country picker is all we need.
+                    return country_btn, language_btn, country_list
                 elif (not language_btn) and any("English" in t for t in texts):
                     language_btn = trig
-                if country_btn and language_btn:
-                    return country_btn, language_btn, country_list
             except Exception:
                 try: page.keyboard.press("Escape")
                 except Exception: pass
-        if country_btn and language_btn:
-            break
 
-    if not country_btn or not language_btn:
-        raise RuntimeError(
-            f"Could not find country/language pickers (country={bool(country_btn)}, "
-            f"language={bool(language_btn)}). See disney_debug/page_dump.html"
-        )
-    return country_btn, language_btn, country_list
+    raise RuntimeError(
+        f"Could not find the country picker (country={bool(country_btn)}). "
+        f"See {OUTDIR / 'page_dump.html'} and pickers_page.png"
+    )
 
 def select_from_list_by_normalized_text(page: Page, trigger: Locator, target_label: str) -> Tuple[bool, Optional[str]]:
     """
@@ -735,6 +738,90 @@ def select_from_list_by_normalized_text(page: Page, trigger: Locator, target_lab
 
     page.keyboard.press("Escape")
     return False, None
+
+# ---------------------- COMBINED "Country (Language)" PICKER HELPERS ----------------------
+_SCROLL_JS = """el => {
+  let n = el;
+  while (n && n.scrollHeight <= n.clientHeight + 2) n = n.parentElement;
+  n = n || el;
+  n.scrollTop += n.clientHeight * 0.8;
+}"""
+
+_LABEL_RE = re.compile(r"^(.*?)\s*\(([^)]*)\)\s*$")   # "Algeria (English)" -> ("Algeria", "English")
+
+def split_label(label: str) -> Tuple[str, str]:
+    """'Algeria (English)' -> ('Algeria', 'English'); labels without a suffix return (label, '')."""
+    m = _LABEL_RE.match(label or "")
+    return (m.group(1).strip(), m.group(2).strip()) if m else ((label or "").strip(), "")
+
+def collect_all_options(page: Page, trigger: Locator, max_rounds: int = 400) -> List[str]:
+    """Open the picker and scroll it to the end, collecting every option label (lists are often lazy-rendered)."""
+    trigger.scroll_into_view_if_needed()
+    trigger.click()
+    lb = page.get_by_role("listbox").first
+    lb.wait_for(timeout=5000)
+    seen: Dict[str, None] = {}
+    stalls = rounds = 0
+    while stalls < 4 and rounds < max_rounds:
+        rounds += 1
+        before = len(seen)
+        for el in lb.locator("[role='option']").all():
+            try:
+                t = _clean(el.inner_text())
+                t = re.sub(r"\s*Selected$", "", t).strip()
+                if t and t not in seen:
+                    seen[t] = None
+            except Exception:
+                pass
+        stalls = stalls + 1 if len(seen) == before else 0
+        try:
+            lb.evaluate(_SCROLL_JS)
+        except Exception:
+            break
+        page.wait_for_timeout(150)
+    page.keyboard.press("Escape")
+    return list(seen)
+
+def build_country_variants(labels: List[str]) -> List[str]:
+    """One label per country; prefer the English variant, else the first one seen."""
+    best: Dict[str, Tuple[str, bool]] = {}
+    for lab in labels:
+        name, lang = split_label(lab)
+        iso2 = country_to_iso2_fuzzy(name)
+        key = iso2 if (isinstance(iso2, str) and len(iso2) == 2) else name
+        is_en = lang.lower().startswith("english")
+        if key not in best or (is_en and not best[key][1]):
+            best[key] = (lab, is_en)
+    return [v[0] for v in best.values()]
+
+def select_option_exact(page: Page, trigger: Locator, label: str) -> bool:
+    """Open the picker, scroll until the option with this exact label is found, click it."""
+    trigger.scroll_into_view_if_needed()
+    trigger.click()
+    lb = page.get_by_role("listbox").first
+    lb.wait_for(timeout=5000)
+    for _ in range(80):
+        cands = [lb.get_by_role("option", name=label, exact=True),
+                 lb.locator("[role='option']").filter(has_text=label)]
+        for cand in cands:
+            try:
+                for k in range(min(cand.count(), 5)):
+                    el = cand.nth(k)
+                    if _clean(el.inner_text()).removesuffix("Selected").strip() != label:
+                        continue
+                    el.scroll_into_view_if_needed()
+                    el.click(force=True, timeout=2000)
+                    page.wait_for_timeout(300)
+                    return True
+            except Exception:
+                pass
+        try:
+            lb.evaluate(_SCROLL_JS)
+        except Exception:
+            break
+        page.wait_for_timeout(120)
+    page.keyboard.press("Escape")
+    return False
 
 # ---------------------- NORMALIZATION HELPERS (ISO CODES) ----------------------
 CURRENCY_MAP = {
@@ -950,59 +1037,41 @@ def main() -> Optional[Path]:
         close_cookies(page)
 
         try:
-            country_btn, language_btn, countries = discover_pickers(page)
+            country_btn, language_btn, _first_page = discover_pickers(page)
+            all_labels = collect_all_options(page, country_btn)
+            countries = build_country_variants(all_labels)
+            print(f"[info] {len(all_labels)} picker options -> {len(countries)} countries")
+            if all_labels:
+                print(f"[info] first options: {all_labels[:5]}")
         except Exception as e:
             print(f"[fatal] {e}"); return
 
         if MODE == "test":
-            if SELECTED_ISO2:
-                print(f"[TEST] Using ISO-2 selection: {SELECTED_ISO2}")
-                picked: List[str] = []
-                for iso2 in SELECTED_ISO2:
-                    name = canonical_country_from_iso2(iso2)
-                    label = closest_text(name, countries, cutoff=80)
-                    if label and label not in picked:
-                        picked.append(label)
-
-                if picked:
-                    countries = picked
-                    print(f"[TEST] Mapped to picker countries: {countries}")
-                else:
-                    # Fallback to the previous hard-coded demo sample
-                    countries = [
-                        "United States",
-                        "United Kingdom",
-                        "Japan",
-                        "Türkiye",
-                        "Brazil",
-                        "Saint Lucia",
-                    ]
-            else:
-                # No explicit selection from the UI – use the original test sample
-                countries = [
-                    "United States",
-                    "United Kingdom",
-                    "Japan",
-                    "Türkiye",
-                    "Brazil",
-                    "Saint Lucia",
-                ]
-
+            wanted_iso2 = list(SELECTED_ISO2) or ["US", "GB", "JP", "TR", "BR", "LC"]
+            print(f"[TEST] Using ISO-2 selection: {wanted_iso2}")
+            by_iso: Dict[str, str] = {}
+            for lab in countries:
+                key = country_to_iso2_fuzzy(split_label(lab)[0])
+                if isinstance(key, str) and len(key) == 2 and key not in by_iso:
+                    by_iso[key] = lab
+            picked = [by_iso[c] for c in wanted_iso2 if c in by_iso]
+            missing = [c for c in wanted_iso2 if c not in by_iso]
+            if missing:
+                print(f"[TEST] Not found in picker: {missing}")
+            if not picked:
+                print("[fatal] none of the requested test countries exist in the picker"); return
+            countries = picked
+            print(f"[TEST] Mapped to picker options: {countries}")
 
         for i, requested_country in enumerate(countries, 1):
             print(f"\n[{i}/{len(countries)}] {requested_country}")
             try:
-                ok, clicked_label = select_from_list_by_normalized_text(page, country_btn, requested_country)
+                ok = select_option_exact(page, country_btn, requested_country)
+                clicked_label = requested_country if ok else None
                 if not ok:
-                    print(f"  [skip] '{requested_country}' not available in picker (no safe match).")
+                    print(f"  [skip] '{requested_country}' not selectable in picker.")
                     continue
-
-                page.wait_for_timeout(500)
-                try:
-                    select_from_list_by_normalized_text(page, language_btn, "English")
-                except Exception:
-                    pass
-                page.wait_for_timeout(400)
+                page.wait_for_timeout(800)
 
                 try:
                     lang_attr = page.evaluate("document.documentElement.lang") or "en-GB"
@@ -1032,9 +1101,9 @@ def main() -> Optional[Path]:
                 page_text = soup.get_text(" ", strip=True)
 
                 # COUNTRY: resolve to ISO-2 from the clicked label, then canonical EN name
-                iso2 = country_to_iso2_fuzzy(clicked_label or requested_country)
+                iso2 = country_to_iso2_fuzzy(split_label(clicked_label or requested_country)[0])
                 if len(iso2) != 2 or not iso2.isalpha():
-                    iso2 = country_to_iso2_fuzzy(requested_country)
+                    iso2 = country_to_iso2_fuzzy(split_label(requested_country)[0])
                 iso2 = (iso2.upper() if isinstance(iso2, str) else iso2)
                 country_canonical = canonical_country_from_iso2(iso2) if isinstance(iso2, str) and len(iso2)==2 else (clicked_label or requested_country)
 
