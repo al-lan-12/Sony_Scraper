@@ -14,6 +14,7 @@
 import re, time, threading, sqlite3, asyncio
 from datetime import datetime, UTC, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutTimeout
 from urllib.parse import urlparse
 from pathlib import Path  # put near the top of the file if not already imported
 
@@ -35,14 +36,16 @@ OUTPUT_DIR = BASE_DIR  # or BASE_DIR / "outputs" if you prefer a subfolder
 
 # =========================== Config ===========================
 
-MAX_WORKERS = 6
+MAX_WORKERS = 12
+BANNER_CONCURRENCY = 3  # parallel banner pages inside the shared browser (lower = fewer Chromium crashes)
+BANNER_TIMEOUT = 30     # seconds per country banner attempt
 
 SESSION = requests.Session()
 SESSION.mount(
     "https://",
     HTTPAdapter(
         max_retries=Retry(
-            total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]
+            total=1, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504]
         )
     ),
 )
@@ -59,6 +62,7 @@ SESSION.headers.update(
 
 # Translation (for language-agnostic heuristics)
 translator = GoogleTranslator(source="auto", target="en")
+_TR_POOL = ThreadPoolExecutor(max_workers=2)
 
 TIER_ORDER = ["Student", "Individual", "Family"]
 
@@ -81,12 +85,14 @@ REGION_LOCALE_PATHS.update(
     {
         "US": [""],
         "GB": ["uk", "gb"],
+        "EG": ["eg", "eg-ar"],
     }
 )
 
 MISSING_DB = OUTPUT_DIR / "apple_music_missing.sqlite"
 MISSING_CSV = OUTPUT_DIR / "apple_music_missing.csv"
 MISSING_BUFFER = []
+_MISSING_LOCK = threading.Lock()
 
 # Symbol currencies (for quick hinting)
 CURRENCY_CHARS = r"[$€£¥₩₫₱₹₪₭₮₦₲₴₡₵₺₼₸៛₨₥₾฿₽]"
@@ -101,6 +107,9 @@ LOCAL_CURRENCY_TOKENS = [
     r"лв",       # Bulgaria
     r"\bгрн\b",  # Ukraine (UAH, occasionally in Cyrillic)
     r"\b₽\b",    # Ruble sign (sometimes appears as symbol; kept for safety)
+    r"\bEGP\b",  # Egypt
+    r"E£",       # Egypt
+    r"ج\.\s?م\.?",  # Egypt (Arabic)
 ]
 
 # Currency tokenization: used by price regex to capture "currency + number" or "number + currency"
@@ -124,7 +133,7 @@ STRICT_PRICE_NUMBER = re.compile(
     r"(\d{1,3}(?:[.,\s]\d{3})+|\d+[.,]\d{1,2})"
 )
 
-BANNER_SEMAPHORE = threading.Semaphore(3)
+BANNER_SEMAPHORE = threading.Semaphore(BANNER_CONCURRENCY)
 
 COUNTRY_CORRECTIONS = {
     "台灣": "Taiwan",
@@ -145,10 +154,30 @@ MANUAL_COUNTRY_FIXES = {
 TEST_MODE = True
 TEST_COUNTRIES = ["US", "KW", "ID", "IN", "TR", "HU", "FR"]
 
+# Territories confirmed (from previous full runs) to have NO Apple Music storefront.
+# They are skipped instantly instead of costing HTTP calls. Set to False to re-check them all.
+SKIP_KNOWN_NO_STOREFRONT = True
+KNOWN_NO_STOREFRONT = {
+    "AF", "AD", "AQ", "AS", "AW", "AX", "BD", "BI", "BL", "BQ", "BV", "CC", "CF", "CK", "CU",
+    "CW", "CX", "DJ", "EH", "ER", "ET", "FK", "FO", "GF", "GG", "GI", "GL", "GN", "GP", "GQ",
+    "GS", "GU", "HM", "HT", "IM", "IO", "IR", "JE", "KI", "KM", "KP", "LI", "LS", "MC", "MF",
+    "MH", "MP", "MQ", "NC", "NF", "NR", "NU", "PF", "PM", "PN", "PR", "PS", "PW", "RE", "SD",
+    "SH", "SJ", "SM", "SO", "SS", "SX", "SY", "TF", "TG", "TK", "TL", "TV", "UM", "VA", "VI",
+    "WF", "WS", "YT",
+}
+# Working copy used during a run; refresh_skip_list() removes countries whose storefront has appeared.
+_ACTIVE_SKIP = set(KNOWN_NO_STOREFRONT)
+
 # ================= Utilities =================
 
+# Arabic-Indic / Persian digits and separators -> ASCII
+_DIGIT_MAP = str.maketrans(
+    "٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹٫٬",
+    "01234567890123456789.,",
+)
+
 def _clean(s: str) -> str:
-    return (s or "").replace("\xa0", " ").strip()
+    return (s or "").replace("\xa0", " ").translate(_DIGIT_MAP).strip()
 
 def _cast_num(x):
     try:
@@ -162,8 +191,9 @@ def _cast_num(x):
 
 @lru_cache(maxsize=4096)
 def translate_text_cached(text: str) -> str:
+    # hard 5s timeout so a slow/blocked translator can never freeze the scrape
     try:
-        return (translator.translate(text or "") or "").lower()
+        return (_TR_POOL.submit(translator.translate, text or "").result(timeout=5) or "").lower()
     except Exception:
         return (text or "").lower()
 
@@ -209,6 +239,11 @@ KNOWN_ISO = set(HARDCODE_FALLBACKS.values())
 
 # Strong tokens (explicit/unambiguous). Add TL/Ft etc.
 STRONG_TOKENS = [
+    # Egypt (must come before plain £)
+    (r"E£", "EGP"),
+    (r"ج\.\s?م", "EGP"),
+    (r"(?i)\bEGP\b", "EGP"),
+
     # Apple locale abbreviations
     (r"(?i)\bTL\b", "TRY"),
     (r"(?i)\bFt\b", "HUF"),
@@ -449,17 +484,18 @@ def init_missing_db():
 
 def log_missing(country, code, url, reason):
     ts = datetime.now(UTC).isoformat(timespec="seconds")
-    con = sqlite3.connect(str(MISSING_DB))
-    cur = con.cursor()
-    cur.execute(
-        "INSERT INTO missing (ts,country,country_code,url,reason) VALUES (?,?,?,?,?)",
-        (ts, country, code, url, reason),
-    )
-    con.commit()
-    con.close()
-    MISSING_BUFFER.append(
-        {"ts": ts, "country": country, "country_code": code, "url": url, "reason": reason}
-    )
+    with _MISSING_LOCK:
+        con = sqlite3.connect(str(MISSING_DB))
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO missing (ts,country,country_code,url,reason) VALUES (?,?,?,?,?)",
+            (ts, country, code, url, reason),
+        )
+        con.commit()
+        con.close()
+        MISSING_BUFFER.append(
+            {"ts": ts, "country": country, "country_code": code, "url": url, "reason": reason}
+        )
 
 # ================= Recurring price selection (trial-proof) =================
 # We avoid "penalize trial" because Apple often writes: "$0.49 for 3 months..., then $5.49/month"
@@ -468,10 +504,21 @@ def log_missing(country, code, url, reason):
 #   - Else tokens whose nearby translated context looks monthly
 #   - Else MAX numeric token (recurring almost always larger)
 
-EN_THEN_RE = re.compile(r"(?i)\b(then|after|thereafter|following|from then)\b")
-EN_MONTH_RE = re.compile(r"(?i)(/\s*month\b|\bper\s+month\b|\bmonthly\b|\beach\s+month\b|\ba\s+month\b)")
+EN_THEN_RE = re.compile(
+    r"(?i)\b(then|after|thereafter|dann|danach|ensuite|puis|despu[eé]s|luego|poi|dopo|"
+    r"sonra|ard[ıi]ndan|potom|n[aá]sledn[eě]|nast[eę]pnie|potem|apoi|dup[aă]|azut[aá]n|majd|"
+    r"затем|потом|после|потім|тоді|след това|ثم|بعد)\b"
+)
+EN_MONTH_RE = re.compile(
+    r"(?i)(/\s*(month|mo|mois|monat|mes|mese|maand|ay|h[oó]|m[eě]s[ií]c|miesi[aą]c|lun[aă]|bulan|th[aá]ng|شهر)\b"
+    r"|per\s+month|monthly|each\s+month|a\s+month|par\s+mois|pro\s+monat|al\s+mes|al\s+mese|"
+    r"per\s+maand|aylık|havi|měsíčně|miesięcznie|месяц|місяць|месец|/月|每月|月額|/월|개월|เดือน|"
+    r"شهريا|شهريًا|في الشهر|كل شهر|شهر)"
+)
 
-def pick_recurring_price_token(text: str):
+def pick_recurring_price_token(text: str, strict: bool = False):
+    # strict=True (banner/body text): only accept a price that has a "then/after" cue before it
+    # or a "/month" cue after it. Rejects footer junk such as "© 2026 ... R".
     if not text:
         return None, None, []
 
@@ -489,18 +536,24 @@ def pick_recurring_price_token(text: str):
             continue
 
         a, b = m.span()
-        ctx_raw = t[max(0, a - 60): min(len(t), b + 60)]
-        ctx_en = translate_text_cached(ctx_raw)
+        # Local, language-agnostic context check (no network translation per token):
+        #   "then/after" appears just BEFORE the price; "/month" just AFTER it.
+        before = t[max(0, a - 60):a]
+        after = t[b:min(len(t), b + 40)]
 
-        has_then = bool(EN_THEN_RE.search(ctx_en))
-        has_month = bool(EN_MONTH_RE.search(ctx_en))
+        has_then = bool(EN_THEN_RE.search(before))
+        has_month = bool(EN_MONTH_RE.search(after))
 
-        cands.append((token, val, has_then, has_month, ctx_en, a))
+        cands.append((token, val, has_then, has_month, f"{before}|{after}", a))
 
     if not cands:
         return None, None, []
 
-    pool = [c for c in cands if c[2]] or [c for c in cands if c[3]] or cands
+    pool = [c for c in cands if c[2]] or [c for c in cands if c[3]]
+    if not pool:
+        if strict:
+            return None, None, []
+        pool = cands
 
     # pick max value; tie-breaker later in text
     pool.sort(key=lambda x: (x[1], x[5]), reverse=True)
@@ -521,7 +574,7 @@ def candidate_price_nodes(card: Tag):
     for el in card.find_all(True):
         txt = (el.get("aria-label") or el.get_text(" ", strip=True) or "")
         if txt and re.search(
-            rf"{CURRENCY_CHARS}|Rp|\bTL\b|\bFt\b|Kč|zł|\blei\b|лв|грн|"
+            rf"{CURRENCY_CHARS}|Rp|\bTL\b|\bFt\b|Kč|zł|\blei\b|лв|грн|EGP|E£|ج\.\s?م|"
             r"SAR|QAR|AED|KWD|BHD|OMR|RM|HK\$|NT\$|US\$",
             txt,
             re.I,
@@ -533,6 +586,17 @@ def candidate_price_nodes(card: Tag):
             seen.add(id(n))
             out.append(n)
     return out
+
+def _prune_cards(cards):
+    """Drop whole-section containers and nested duplicates; keep outermost real cards."""
+    ids = {id(c) for c in cards}
+
+    def n_inner(c):
+        return sum(1 for d in c.descendants if isinstance(d, Tag) and id(d) in ids)
+
+    cards = [c for c in cards if n_inner(c) < 2]
+    ids = {id(c) for c in cards}
+    return [c for c in cards if not any(id(p) in ids for p in c.parents)]
 
 def find_plan_cards(soup: BeautifulSoup):
     section = (
@@ -558,7 +622,7 @@ def find_plan_cards(soup: BeautifulSoup):
     if not cards or len(cards) < 2:
         cards = soup.select("#student, #individual, #family") or cards
 
-    return section, cards
+    return section, _prune_cards(list(cards))
 
 def classify_plan_card(card: Tag, idx: int):
     cid = (card.get("id") or "").lower()
@@ -692,61 +756,212 @@ def _extract_cc(url):
     m = CC_URL_RE.search(url) or MUSIC_CC_URL_RE.search(url)
     return (m.group(1) or "").upper() if m else ""
 
-async def _get_music_banner_text_async(country_code: str):
-    cc = country_code.lower()
-    candidates = [
-        f"https://music.apple.com/{cc}/new",
-        f"https://music.apple.com/{cc}/browse",
-        f"https://music.apple.com/{cc}/listen-now",
-    ]
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
-        page = await ctx.new_page()
+class _BrowserRunner:
+    """One shared headless Chromium for the whole run, driven from a private asyncio loop thread.
+    Created lazily (first banner fallback) so importing this module has no side effects."""
+
+    def __init__(self, concurrency=BANNER_CONCURRENCY):
+        self.loop = asyncio.new_event_loop()
+        self._pw = None
+        self._browser = None
+        self._lock = None
+        self._sem = None
+        self._concurrency = concurrency
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    async def _ensure(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+            self._sem = asyncio.Semaphore(self._concurrency)
+        async with self._lock:
+            if self._browser is None or not self._browser.is_connected():
+                if self._pw is None:
+                    self._pw = await async_playwright().start()
+                self._browser = await self._pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                )
+
+    async def _fetch(self, country_code: str):
+        await self._ensure()
+        cc = country_code.lower()
+        candidates = [
+            f"https://music.apple.com/{cc}/new",
+            f"https://music.apple.com/{cc}/browse",
+        ]
         last = ""
-        for url in candidates:
+        async with self._sem:
+            ctx = await self._browser.new_context()
             try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_load_state("networkidle", timeout=10000)
-                last = page.url or (resp.url if resp else url)
-
-                sels = [
-                    "cwc-music-upsell-banner-web [data-test='subheader-text']",
-                    "[data-test='subheader-text']",
-                    ".cwc-upsell-banner__subhead",
-                ]
-                for sel in sels:
+                # skip heavy resources: much faster page loads
+                await ctx.route(
+                    "**/*",
+                    lambda route: route.abort()
+                    if route.request.resource_type in {"image", "media", "font"}
+                    else route.continue_(),
+                )
+                page = await ctx.new_page()
+                for url in candidates:
                     try:
-                        el = page.locator(sel).first
-                        await el.wait_for(state="visible", timeout=3000)
-                        t = await el.inner_text()
-                        if t and t.strip():
-                            await browser.close()
-                            return t, last
-                    except PWTimeoutError:
-                        continue
+                        resp = await page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                        last = page.url or (resp.url if resp else url)
 
-                t = await page.evaluate("document.body && document.body.innerText || ''")
-                if t and (BANNER_PRICE_REGEX.search(t) or STRICT_PRICE_NUMBER.search(t)):
-                    await browser.close()
-                    return t, last
-            except Exception:
-                continue
-        await browser.close()
+                        # If Apple bounced us to another storefront, stop immediately (no price here)
+                        if _extract_cc(last) != country_code.upper():
+                            return "", last
+
+                        # ONE combined wait instead of three sequential 3.5s waits
+                        try:
+                            el = page.locator(
+                                "cwc-music-upsell-banner-web [data-test='subheader-text'], "
+                                "[data-test='subheader-text'], .cwc-upsell-banner__subhead"
+                            ).first
+                            await el.wait_for(state="visible", timeout=4000)
+                            t = await el.inner_text()
+                            if t and t.strip() and pick_recurring_price_token(t, strict=True)[0]:
+                                return t, last
+                        except PWTimeoutError:
+                            pass
+
+                        # Fallback: short hydrate wait, then read document AND open shadow roots;
+                        # only accept it if it has a real price+month cue.
+                        await page.wait_for_timeout(1200)
+                        t = await page.evaluate(
+                            """() => {
+                                const out = [document.body ? document.body.innerText : ''];
+                                const walk = (root) => {
+                                    for (const el of root.querySelectorAll('*')) {
+                                        if (el.shadowRoot) {
+                                            out.push(Array.from(el.shadowRoot.children)
+                                                .map(c => c.innerText || '').join(' '));
+                                            walk(el.shadowRoot);
+                                        }
+                                    }
+                                };
+                                walk(document);
+                                return out.join(' ');
+                            }"""
+                        )
+                        if t and pick_recurring_price_token(t, strict=True)[0]:
+                            return t, last
+                        # Page loaded fine but has no banner price: a second URL won't help.
+                        break
+                    except Exception as e:
+                        print(f"[banner] {country_code} {url}: {type(e).__name__}: {str(e)[:120]}")
+                        continue
+            finally:
+                await ctx.close()
         return "", last
 
-def banner_individual_row(alpha2: str, country_name: str, meta=None):
-    with BANNER_SEMAPHORE:
+    def fetch(self, country_code: str, timeout=BANNER_TIMEOUT):
+        fut = asyncio.run_coroutine_threadsafe(self._fetch(country_code), self.loop)
         try:
-            text, final_url = asyncio.run(_get_music_banner_text_async(alpha2))
-        except RuntimeError:
-            holder = {}
-            def runner():
-                holder["pair"] = asyncio.run(_get_music_banner_text_async(alpha2))
-            t = threading.Thread(target=runner, daemon=True)
-            t.start()
-            t.join()
-            text, final_url = holder.get("pair", ("", ""))
+            return fut.result(timeout=timeout)
+        except Exception:
+            fut.cancel()
+            raise
+
+    def close(self):
+        async def _close():
+            try:
+                if self._browser:
+                    await self._browser.close()
+                if self._pw:
+                    await self._pw.stop()
+            except Exception:
+                pass
+        try:
+            asyncio.run_coroutine_threadsafe(_close(), self.loop).result(timeout=10)
+        except Exception:
+            pass
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+_RUNNER = None
+_RUNNER_LOCK = threading.Lock()
+
+def get_runner():
+    global _RUNNER
+    with _RUNNER_LOCK:
+        if _RUNNER is None:
+            _RUNNER = _BrowserRunner()
+        return _RUNNER
+
+def close_runner():
+    global _RUNNER
+    with _RUNNER_LOCK:
+        if _RUNNER is not None:
+            _RUNNER.close()
+            _RUNNER = None
+
+def storefront_exists(cc: str) -> bool:
+    """False only if music.apple.com clearly redirects to a different storefront."""
+    try:
+        r = SESSION.get(f"https://music.apple.com/{cc.lower()}/new", timeout=8, allow_redirects=True)
+        final_cc = _extract_cc(r.url)
+        if final_cc and final_cc != cc.upper():
+            return False
+        return True
+    except Exception:
+        return True
+
+def refresh_skip_list(codes):
+    """Quick parallel check of the known-no-storefront countries in this run.
+    If music.apple.com now serves that country's own storefront, un-skip it for this run."""
+    global _ACTIVE_SKIP
+    _ACTIVE_SKIP = set(KNOWN_NO_STOREFRONT)
+    if not SKIP_KNOWN_NO_STOREFRONT:
+        return
+    to_check = [c for c in codes if c in KNOWN_NO_STOREFRONT]
+    if not to_check:
+        return
+
+    def _chk(c):
+        try:
+            r = SESSION.get(f"https://music.apple.com/{c.lower()}/new", timeout=(4, 6), allow_redirects=True)
+            return c, (r.status_code == 200 and _extract_cc(r.url) == c.upper())
+        except Exception:
+            return c, False  # can't confirm -> keep skipping
+
+    revived = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for c, ok in pool.map(_chk, to_check):
+            if ok:
+                _ACTIVE_SKIP.discard(c)
+                revived.append(c)
+    if revived:
+        print(f"🆕 Storefront now available, will scrape: {sorted(revived)} "
+              f"(remove them from KNOWN_NO_STOREFRONT)")
+    else:
+        print(f"⏭️ Skipping {len(to_check)} known no-storefront territories (none newly available)")
+
+def banner_individual_row(alpha2: str, country_name: str, meta=None):
+    if not storefront_exists(alpha2):
+        log_missing(
+            country_name, alpha2, f"https://music.apple.com/{alpha2.lower()}/new",
+            "No Apple Music storefront (redirected away)",
+        )
+        return []
+
+    text, final_url, err = "", "", None
+    with BANNER_SEMAPHORE:
+        for _attempt in range(2):  # retry ONLY if Chromium errored/crashed (not when there's simply no banner)
+            try:
+                text, final_url = get_runner().fetch(alpha2)
+                err = None
+                break
+            except Exception as e:
+                err = e
+    if err is not None and not (text and text.strip()):
+        log_missing(
+            country_name, alpha2, f"https://music.apple.com/{alpha2.lower()}/new",
+            f"banner fetch failed: {type(err).__name__}: {str(err)[:120]}",
+        )
+        return []
 
     store_cc = _extract_cc(final_url)
     if not store_cc or store_cc != alpha2.upper():
@@ -758,8 +973,15 @@ def banner_individual_row(alpha2: str, country_name: str, meta=None):
         )
         return []
 
-    chosen_tok, chosen_val, _dbg = pick_recurring_price_token(text)
+    if not text or not text.strip():
+        log_missing(country_name, alpha2, final_url, "banner text empty")
+        return []
+
+    chosen_tok, chosen_val, _dbg = pick_recurring_price_token(text, strict=True)
     if not chosen_tok or chosen_val is None:
+        digit_lines = [ln.strip() for ln in _clean(text).splitlines() if re.search(r"\d", ln)]
+        snippet = re.sub(r"\s+", " ", " | ".join(digit_lines))[:200]
+        log_missing(country_name, alpha2, final_url, f"no price token in banner text: {snippet}")
         return []
 
     disp = _clean(chosen_tok)
@@ -868,6 +1090,9 @@ def scrape_country(alpha2: str):
     if not cc or len(cc) != 2:
         return []
 
+    if SKIP_KNOWN_NO_STOREFRONT and cc in _ACTIVE_SKIP:
+        return []
+
     base = APPLE_BASE_BY_CC.get(cc, "https://www.apple.com")
     paths = REGION_LOCALE_PATHS.get(cc, [cc.lower()])
 
@@ -878,7 +1103,7 @@ def scrape_country(alpha2: str):
         url = f"{base}/apple-music/" if path == "" else f"{base}/{path}/apple-music/"
         last_url = url
         try:
-            resp = SESSION.get(url, timeout=15, allow_redirects=True)
+            resp = SESSION.get(url, timeout=(5, 10), allow_redirects=True)
 
             if resp.status_code == 200 and "apple.com" in urlparse(resp.url).netloc:
                 had_apple_page = True
@@ -987,7 +1212,8 @@ def scrape_country(alpha2: str):
                 },
             )
 
-        except Exception:
+        except Exception as e:
+            print(f"[APPLE MUSIC] {cc} {url}: {type(e).__name__}: {str(e)[:120]}")
             continue
 
     cn = normalize_country_name(get_country_name_from_code(cc))
@@ -1026,15 +1252,21 @@ def run_scraper(country_codes_override=None):
         print("⚠️ No country codes to scrape.")
         return
 
+    refresh_skip_list(all_codes)
+
     all_rows = []
     failed_codes = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(scrape_country, cc): cc for cc in all_codes}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Scraping countries", unit="cc"):
+    ex = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    futures = {ex.submit(scrape_country, cc): cc for cc in all_codes}
+    try:
+        total_timeout = 180 + 60 * len(all_codes) // MAX_WORKERS
+        for fut in tqdm(as_completed(futures, timeout=total_timeout),
+                        total=len(futures), desc="Scraping countries", unit="cc"):
             cc = futures[fut]
             try:
                 res = fut.result()
+                print(f"[APPLE MUSIC] {cc}: {len(res or [])} rows")
                 if res:
                     all_rows.extend(res)
             except Exception as e:
@@ -1046,6 +1278,10 @@ def run_scraper(country_codes_override=None):
                     f"https://www.apple.com/{cc.lower()}/apple-music/",
                     f"Future exception: {type(e).__name__}: {e}",
                 )
+    except FutTimeout:
+        print("⚠️ Overall timeout hit; exporting what we have.")
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
     if failed_codes:
         print(f"🔁 Retrying {len(failed_codes)} failed countries sequentially…")
@@ -1064,8 +1300,14 @@ def run_scraper(country_codes_override=None):
                     f"Retry exception: {type(e).__name__}: {e}",
                 )
 
+    close_runner()
+
     if not all_rows:
         print("⚠️ No rows scraped at all.")
+        if MISSING_BUFFER:
+            pd.DataFrame(MISSING_BUFFER).to_csv(MISSING_CSV, index=False)
+            for m in MISSING_BUFFER:
+                print(f"   - {m['country_code']}: {m['reason']}")
         return
 
     df = pd.DataFrame(all_rows)
@@ -1080,6 +1322,8 @@ def run_scraper(country_codes_override=None):
     if MISSING_BUFFER:
         pd.DataFrame(MISSING_BUFFER).to_csv(MISSING_CSV, index=False)
         print(f"⚠️ Logged {len(MISSING_BUFFER)} issues to {MISSING_CSV} / {MISSING_DB}")
+        for m in MISSING_BUFFER:
+            print(f"   - {m['country_code']}: {m['reason']}")
 
     return str(full_path)
 
@@ -1106,7 +1350,10 @@ def run_apple_music_scraper(test_mode: bool = True, test_countries=None) -> str 
         print(f"[APPLE MUSIC] UI-driven test countries: {TEST_COUNTRIES}")
 
     start = time.time()
-    excel_path = run_scraper(country_codes_override=country_override)
+    try:
+        excel_path = run_scraper(country_codes_override=country_override)
+    finally:
+        close_runner()
     print(f"[APPLE MUSIC] Finished in {round(time.time() - start, 2)}s")
 
     return excel_path
