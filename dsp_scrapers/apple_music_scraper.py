@@ -447,11 +447,57 @@ def extract_amount_number(text: str) -> str:
 
 # ================= Plan name normalization =================
 
+# Multilingual plan keywords (local, no translation needed).
+_PLAN_TEXT_PATTERNS = {
+    "Student": [
+        r"\bstudent", r"\b[ée]tudiant", r"\bestudiant", r"\bstudierende", r"\böğrenci", r"\bogrenci",
+        r"\bdiák", r"\bhallgató", r"\bstudenck", r"\bestudante", r"\baluno", r"\bopiskelija",
+        r"\bstuderende", r"\bmahasiswa", r"\bpelajar", r"\bsinh viên",
+        "学生", "學生", "학생", "นักศึกษา", "طالب", "طلاب", "студент", "φοιτητ", "סטודנט",
+    ],
+    "Family": [
+        r"\bfamil", r"\bfamiglia", r"\baile\b", r"\bcsalád", r"\brodzin", r"\brodin", r"\bperhe",
+        r"\bkeluarga", r"\bgia đình",
+        "ファミリー", "家庭", "家人", "패밀리", "가족", "ครอบครัว", "عائل", "أسرة", "семей", "семья",
+        "οικογεν", "משפחה",
+    ],
+    "Individual": [
+        r"\bindividu", r"\beinzel", r"\bbireysel", r"\begyéni", r"\bindywidual", r"\bjednotliv",
+        r"\byksilö", r"\bpersonlig", r"\bperorangan", r"\bcá nhân",
+        "個人", "个人", "개인", "บุคคล", "فرد", "индивидуал", "ατομικ", "אישי", "יחיד",
+    ],
+}
+_PLAN_TEXT_RES = {p: re.compile("|".join(pats), re.I) for p, pats in _PLAN_TEXT_PATTERNS.items()}
+_PLAN_ATTR_RES = {
+    "Student": re.compile(r"student", re.I),
+    "Family": re.compile(r"family", re.I),
+    "Individual": re.compile(r"individual|personal", re.I),
+}
+
+def _plans_in_text(text: str) -> set:
+    t = _clean(text or "")
+    return {p for p, rx in _PLAN_TEXT_RES.items() if rx.search(t)}
+
+def _plans_in_attrs(el) -> set:
+    if not isinstance(el, Tag):
+        return set()
+    vals = " ".join([
+        el.get("id") or "",
+        el.get("data-analytics-name") or "",
+        el.get("data-analytics-title") or "",
+        " ".join(el.get("class") or []),
+    ])
+    return {p for p, rx in _PLAN_ATTR_RES.items() if rx.search(vals)}
+
 @lru_cache(maxsize=None)
 def standardize_plan(plan_text, idx):
     raw = (plan_text or "").strip().lower()
     if not raw:
         return TIER_ORDER[idx] if idx < len(TIER_ORDER) else "Individual"
+
+    hits = _plans_in_text(raw)
+    if len(hits) == 1:
+        return next(iter(hits))
 
     if "student" in raw:
         return "Student"
@@ -622,35 +668,62 @@ def find_plan_cards(soup: BeautifulSoup):
     if not cards or len(cards) < 2:
         cards = soup.select("#student, #individual, #family") or cards
 
-    return section, _prune_cards(list(cards))
+    # No pruning: container cards are detected and skipped in classify_plan_card instead.
+    return section, list(cards)
 
 def classify_plan_card(card: Tag, idx: int):
-    cid = (card.get("id") or "").lower()
-    if cid in {"student", "individual", "family"}:
-        return cid.capitalize()
+    """Return (plan, confidence) or (None, 0).
+    Language-independent first (English class/id/analytics attributes Apple uses on every locale),
+    then multilingual heading text, then multilingual full text. Cards that mention several plans
+    (section containers) are skipped instead of guessed."""
+    # 1) the card's own attributes
+    own = _plans_in_attrs(card)
+    if len(own) == 1:
+        return next(iter(own)), 4
 
-    dan = (card.get("data-analytics-name") or "").lower()
-    if "student" in dan:
-        return "Student"
-    if "individual" in dan or "personal" in dan:
-        return "Individual"
-    if "family" in dan:
-        return "Family"
+    # 2) descendants' attributes: exactly one plan -> that plan; several -> it's a container, skip
+    desc = set()
+    for d in card.find_all(True):
+        desc |= _plans_in_attrs(d)
+    if len(desc) == 1:
+        return next(iter(desc)), 3
+    if len(desc) > 1:
+        return None, 0
 
-    head = card.select_one("h1,h2,h3,h4,p,span")
-    if head:
-        return standardize_plan(head.get_text(" ", strip=True), idx)
+    # 3) nearest ancestors' attributes (card may be an inner wrapper)
+    for anc in list(card.parents)[:3]:
+        a = _plans_in_attrs(anc)
+        if len(a) == 1:
+            return next(iter(a)), 3
+        if len(a) > 1:
+            break
 
-    return TIER_ORDER[idx] if idx < len(TIER_ORDER) else "Individual"
+    # 4) heading text in any language
+    head_hits = set()
+    for head in card.select("h1,h2,h3,h4,p.plan-type,[class*=plan-type],[class*=title]"):
+        head_hits |= _plans_in_text(head.get_text(" ", strip=True))
+    if len(head_hits) == 1:
+        return next(iter(head_hits)), 2
+    if len(head_hits) > 1:
+        return None, 0  # headings for several plans -> container, skip
+
+    # 5) full card text in any language (only if unambiguous)
+    hits = _plans_in_text(" ".join(card.stripped_strings))
+    if len(hits) == 1:
+        return next(iter(hits)), 1
+
+    return None, 0
 
 def extract_plan_entries_from_dom_apple(soup: BeautifulSoup, alpha2: str):
     _, cards = find_plan_cards(soup)
     if not cards:
         return {}
 
-    entries = {}
+    found = []  # (confidence, idx, plan, entry)
     for idx, card in enumerate(cards):
-        std = classify_plan_card(card, idx)
+        std, conf = classify_plan_card(card, idx)
+        if not std:
+            continue
 
         headline_bits = []
         for el in candidate_price_nodes(card):
@@ -677,14 +750,26 @@ def extract_plan_entries_from_dom_apple(soup: BeautifulSoup, alpha2: str):
             if why:
                 iso, src = iso_res, f"heuristic-{why}"
 
-        if std not in entries:
-            entries[std] = {
-                "Currency": iso,
-                "Currency Source": src,
-                "Currency Raw": raw_cur,
-                "Price Display": _clean(chosen_tok),
-                "Price Value": _cast_num(float(chosen_val)),
-            }
+        found.append((conf, idx, std, {
+            "Currency": iso,
+            "Currency Source": src,
+            "Currency Raw": raw_cur,
+            "Price Display": _clean(chosen_tok),
+            "Price Value": _cast_num(float(chosen_val)),
+        }))
+
+    # Most confident classification wins for each plan
+    entries = {}
+    for conf, idx, std, e in sorted(found, key=lambda x: (-x[0], x[1])):
+        entries.setdefault(std, e)
+
+    # Sanity check: Family/Student never cost exactly the same as Individual -> misassigned card
+    ind = entries.get("Individual")
+    if ind:
+        for p in ("Family", "Student"):
+            if p in entries and entries[p]["Price Value"] == ind["Price Value"]:
+                print(f"[APPLE MUSIC] {alpha2}: dropped {p} (same price as Individual, likely misread)")
+                entries.pop(p)
 
     return entries
 
