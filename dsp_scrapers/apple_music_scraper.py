@@ -823,11 +823,79 @@ def extract_plan_entries_from_dom_generic(soup: BeautifulSoup, alpha2: str):
             )
     return entries
 
+_HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+def _make_entry(chosen_tok, chosen_val, context_text, alpha2):
+    iso, src, raw_cur = detect_currency_from_display(chosen_tok, alpha2)
+    if src in {"ambiguous_symbol->default", "territory_default"}:
+        iso2, src2 = detect_currency_in_text(context_text, alpha2)
+        if src2 in {"symbol", "code"} and iso2:
+            iso, src = iso2, f"context-{src2}"
+        iso_res, why = resolve_dollar_ambiguity(iso, raw_cur, chosen_val, alpha2, context_text)
+        if why:
+            iso, src = iso_res, f"heuristic-{why}"
+    return {
+        "Currency": iso,
+        "Currency Source": src,
+        "Currency Raw": raw_cur,
+        "Price Display": _clean(chosen_tok),
+        "Price Value": _cast_num(float(chosen_val)),
+    }
+
+def extract_plan_entries_from_headings(soup: BeautifulSoup, alpha2: str):
+    """Layout-independent reader: find SHORT headings naming exactly one plan in any language
+    (e.g. '개인', '가족', '個人', 'Famille', 'Öğrenci'), then read the price written directly under
+    that heading (text up to the next heading). Works on every Apple locale page."""
+    entries = {}
+    for h in soup.find_all(list(_HEADING_TAGS)):
+        title = _clean(h.get_text(" ", strip=True))
+        if not title or len(title) > 40:
+            continue
+        plans = _plans_in_text(title)
+        if len(plans) != 1:
+            continue
+        std = next(iter(plans))
+        if std in entries:
+            continue
+
+        # collect text after the heading until the next heading
+        parts, total = [], 0
+        for el in h.next_elements:
+            if isinstance(el, Tag) and el.name in _HEADING_TAGS:
+                break
+            if isinstance(el, str) and not isinstance(el, Tag):
+                s = el.strip()
+                if s:
+                    parts.append(s)
+                    total += len(s)
+                    if total > 600:
+                        break
+        block = " ".join(parts)
+        if not block:
+            continue
+
+        tok, val, _dbg = pick_recurring_price_token(block)
+        if not tok:
+            continue  # e.g. a 'free trial' heading with no price; a later heading may have it
+        entries[std] = _make_entry(tok, val, block, alpha2)
+    return entries
+
+def _sanity_check_entries(entries, alpha2):
+    ind = entries.get("Individual")
+    if ind:
+        for p in ("Family", "Student"):
+            if p in entries and entries[p]["Price Value"] == ind["Price Value"]:
+                print(f"[APPLE MUSIC] {alpha2}: dropped {p} (same price as Individual, likely misread)")
+                entries.pop(p)
+    return entries
+
 def extract_plan_entries_from_dom(soup: BeautifulSoup, alpha2: str):
-    entries = extract_plan_entries_from_dom_apple(soup, alpha2)
+    by_heading = extract_plan_entries_from_headings(soup, alpha2)
+    by_card = extract_plan_entries_from_dom_apple(soup, alpha2)
+    entries = {**by_card, **by_heading}  # heading-based reading wins when both found a plan
     if entries:
-        return entries
-    return extract_plan_entries_from_dom_generic(soup, alpha2)
+        return _sanity_check_entries(entries, alpha2)
+    return _sanity_check_entries(extract_plan_entries_from_dom_generic(soup, alpha2), alpha2)
 
 # ================= Banner fallback =================
 
