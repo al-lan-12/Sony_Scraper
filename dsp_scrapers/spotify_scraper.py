@@ -740,6 +740,10 @@ async def safe_goto(page, url: str, timeout: int = 60000) -> bool:
 
 
 # ---------- Market discovery ----------
+# base country code -> every locale variant listed by Spotify (e.g. 'cd' -> ['cd-fr', 'cd-sw'])
+ALL_LOCALES: dict = {}
+
+
 async def fetch_markets(playwright) -> List[str]:
     """
     Return a list of locale codes from Spotify's directory
@@ -764,6 +768,9 @@ async def fetch_markets(playwright) -> List[str]:
             if not re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", code):
                 continue
             base = code.split("-")[0]
+            ALL_LOCALES.setdefault(base, [])
+            if code not in ALL_LOCALES[base]:
+                ALL_LOCALES[base].append(code)
             if base not in base_choice or code.endswith("-en"):
                 base_choice[base] = code
         result = list(base_choice.values())
@@ -939,6 +946,46 @@ async def run() -> Optional[str]:
                 old = by_loc.get(loc, [])
                 if len({r["Standard Plan Name"] for r in res}) > len({r["Standard Plan Name"] for r in old}):
                     by_loc[loc] = res
+            all_plans = [p for rows in by_loc.values() for p in rows]
+
+        # ---------- Fill gaps from the country's other language pages ----------
+        # Some localized pages (e.g. DR Congo 'cd-sw') omit cards that the English/French page shows.
+        MAIN = {"Individual", "Student", "Family", "Duo"}
+        gap_jobs = []  # (original_loc, alt_loc)
+        for loc in markets:
+            rows = by_loc.get(loc, [])
+            present = {r["Standard Plan Name"] for r in rows}
+            if MAIN - present - ({"Individual"} if present & CORE else set()):
+                base = loc.split("-")[0]
+                alts = [c for c in ALL_LOCALES.get(base, []) if c != loc]
+                if f"{base}-en" not in alts and f"{base}-en" != loc:
+                    alts.append(f"{base}-en")  # try English even if not listed
+                gap_jobs += [(loc, a) for a in alts]
+
+        if gap_jobs:
+            log(f"🌐 Checking {len(gap_jobs)} alternate-language pages for missing plans…")
+
+            async def _alt(orig, alt):
+                return orig, await scrape_country(alt, pw, sem, wait_ms=2500)
+
+            for fut in asyncio.as_completed([_alt(o, a) for o, a in gap_jobs]):
+                orig, res = await fut
+                if not res:
+                    continue
+                rows = by_loc.setdefault(orig, [])
+                present = {r["Standard Plan Name"] for r in rows}
+                added = []
+                for r in res:
+                    std = r["Standard Plan Name"]
+                    if std in present:
+                        continue
+                    if std == "Individual" and (present & CORE):
+                        continue  # page already has an Individual-type tier (Standard/Basic/...)
+                    rows.append(r)
+                    present.add(std)
+                    added.append(std)
+                if added:
+                    log(f"   + {orig}: added {added} from {res[0]['Country Code']}")
             all_plans = [p for rows in by_loc.values() for p in rows]
 
         if not all_plans:
