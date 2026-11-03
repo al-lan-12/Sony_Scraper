@@ -86,8 +86,49 @@ def _clean_spaces(s: str) -> str:
     return (s or "").replace("\xa0", " ").strip()
 
 
+# Local multilingual plan dictionary (checked BEFORE any translation, so non-English
+# markets like FI / HU / TN / CD no longer depend on googletrans working).
+# Order matters: Duo, Student, Family are checked before Individual.
+_MULTILINGUAL_PLANS = [
+    ("Duo", [r"\bduo\b"]),
+    ("Student", [
+        r"\bstudent", r"[ée]tudiant", r"\bestudiant", r"\bstudierende", r"\bopiskelija",
+        r"\bdiák", r"\begyetemista", r"\böğrenci", r"\bogrenci", r"φοιτητ", r"студент",
+        r"\bmwanafunzi", r"\bwanafunzi", r"\bmahasiswa", r"\bpelajar", r"sinh viên", r"\bestudante",
+        r"\buniversitari", r"\bstudenck", r"\bstudentsk", r"学生", r"學生", r"학생", r"นักศึกษา",
+        r"طالب", r"طلاب", r"סטודנט",
+    ]),
+    ("Family", [
+        r"\bfamil", r"\bfamiglia", r"\bperhe", r"\bcsalád", r"\baile\b", r"\brodzin", r"\brodin",
+        r"οικογεν", r"семей", r"сімей", r"\bkeluarga", r"gia đình", r"ファミリー", r"家庭", r"패밀리",
+        r"가족", r"ครอบครัว", r"عائل", r"משפחה",
+    ]),
+]
+_MULTILINGUAL_INDIVIDUAL = [
+    r"\bindividu", r"\beinzel", r"\byksilö", r"\begyéni", r"\bindywidual", r"\bjednotliv",
+    r"\bindividuál", r"\bbireysel", r"ατομικ", r"индивидуал", r"особист", r"\bbinafsi",
+    r"\bpersonlig", r"\bpessoal", r"\bperorangan", r"cá nhân", r"個人", r"个人", r"개인",
+    r"บุคคล", r"فردي", r"אישי", r"\bpersonal\b", r"\bpersonnel\b",
+]
+_MULTI_RES = [(std, re.compile("|".join(p), re.I)) for std, p in _MULTILINGUAL_PLANS]
+_INDIV_RE = re.compile("|".join(_MULTILINGUAL_INDIVIDUAL), re.I)
+# Spotify's own English tier names (used in some markets, e.g. JP 'Standard', KR 'Basic')
+_TIER_RE = re.compile(r"\b(platinum|lite|basic|mini|standard|audiobooks?)\b", re.I)
+
+
 def normalize_plan_name(name: str) -> str:
     raw = (name or "").strip().lower()
+
+    # 0) Local multilingual dictionary (no network)
+    for std, rx in _MULTI_RES:
+        if rx.search(raw):
+            return std
+    m = _TIER_RE.search(raw)
+    if m:
+        t = m.group(1).lower()
+        return "Audiobooks" if t.startswith("audiobook") else t.capitalize()
+    if _INDIV_RE.search(raw):
+        return "Individual"
 
     # Manual overrides
     if re.search(r"\b(personal|personnel|staff)\b", raw):
@@ -735,7 +776,7 @@ async def fetch_markets(playwright) -> List[str]:
 
 
 # ---------- Scrape one market ----------
-async def scrape_country(locale: str, playwright, semaphore: asyncio.Semaphore) -> List[dict]:
+async def scrape_country(locale: str, playwright, semaphore: asyncio.Semaphore, wait_ms: int = 1200) -> List[dict]:
     async with semaphore:
         browser, ctx = await new_context(playwright)
         page = await ctx.new_page()
@@ -746,10 +787,22 @@ async def scrape_country(locale: str, playwright, semaphore: asyncio.Semaphore) 
         plans: List[dict] = []
         ok = await safe_goto(page, url, timeout=70000)
         if ok:
-            await page.wait_for_timeout(1200)
-            cards = await page.query_selector_all("section:has(h3), div:has(h3), article:has(h3)")
+            await page.wait_for_timeout(wait_ms)
+            all_cards = await page.query_selector_all("section:has(h3), div:has(h3), article:has(h3)")
+
+            # Prefer real plan cards (exactly one <h3>) over big containers holding several plans,
+            # so a container can't "claim" a plan title with another plan's price lines.
+            single, multi = [], []
+            for c in all_cards:
+                try:
+                    n_h3 = len(await c.query_selector_all("h3"))
+                except Exception:
+                    n_h3 = 0
+                (single if n_h3 == 1 else multi).append(c)
+            cards = single + multi
 
             seen = set()
+            seen_std_titles = set()
             for card in cards:
                 try:
                     h3 = await card.query_selector("h3")
@@ -759,6 +812,9 @@ async def scrape_country(locale: str, playwright, semaphore: asyncio.Semaphore) 
 
                     std = normalize_plan_name(title)
                     if std == "Other":
+                        if title.strip().lower() not in seen_std_titles:
+                            seen_std_titles.add(title.strip().lower())
+                            log(f"[SPOTIFY] {locale}: unrecognised card title skipped: {title.strip()[:60]!r}")
                         continue
 
                     title_key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
@@ -860,6 +916,31 @@ async def run() -> Optional[str]:
                 if res:
                     all_plans.extend(res)
 
+        # ---------- Retry markets whose result looks incomplete ----------
+        # e.g. only 'Duo' captured (page not fully rendered / cards missed).
+        CORE = {"Individual", "Standard", "Basic", "Platinum", "Mini", "Lite"}
+        by_loc = {}
+        for p in all_plans:
+            by_loc.setdefault(p["Country Code"], []).append(p)
+
+        def _suspicious(rows):
+            stds = {r["Standard Plan Name"] for r in rows}
+            return len(stds) < 2 or not (stds & CORE)
+
+        retry_locs = [loc for loc in markets if loc not in by_loc or _suspicious(by_loc[loc])]
+        if retry_locs:
+            log(f"🔁 Retrying {len(retry_locs)} incomplete markets with a longer wait: {retry_locs}")
+            retry_tasks = [scrape_country(loc, pw, sem, wait_ms=4000) for loc in retry_locs]
+            for fut in asyncio.as_completed(retry_tasks):
+                res = await fut
+                if not res:
+                    continue
+                loc = res[0]["Country Code"]
+                old = by_loc.get(loc, [])
+                if len({r["Standard Plan Name"] for r in res}) > len({r["Standard Plan Name"] for r in old}):
+                    by_loc[loc] = res
+            all_plans = [p for rows in by_loc.values() for p in rows]
+
         if not all_plans:
             log("❌ No plan cards scraped.")
             return None
@@ -897,9 +978,42 @@ async def run() -> Optional[str]:
         base = f"spotify_cleaned_playwright{'_TEST' if TEST_MODE else ''}"
         xlsx_out = f"{base}.xlsx"
 
+        # ---------- Discrepancy checks (second sheet; app reads the first sheet) ----------
+        checks = []
+        for (a2c, cname_c), grp in df.groupby(["Country Alpha-2", "Country Standard Name"]):
+            stds = list(grp["Standard Plan Name"])
+            s = set(stds)
+            flags = []
+            if len(s) == 1:
+                flags.append("Only one plan captured")
+            if not (s & CORE):
+                flags.append("No Individual-type plan")
+            if "Duo" in s and "Family" not in s:
+                flags.append("Duo but no Family")
+            if "Family" in s and "Duo" not in s:
+                flags.append("Family but no Duo")
+            if "Student" not in s:
+                flags.append("No Student plan")
+            dups = sorted({x for x in stds if stds.count(x) > 1})
+            if dups:
+                flags.append(f"Multiple rows for {', '.join(dups)} (e.g. Family 4 / Family 6)")
+            if flags:
+                checks.append({
+                    "Country": cname_c,
+                    "Country Alpha-2": a2c,
+                    "Plans Captured": ", ".join(sorted(s)),
+                    "Flags": "; ".join(flags),
+                })
+        checks_df = pd.DataFrame(checks, columns=["Country", "Country Alpha-2", "Plans Captured", "Flags"])
+        if len(checks_df):
+            log(f"⚠️ {len(checks_df)} markets flagged for review (see 'Checks' sheet):")
+            for _, r in checks_df.iterrows():
+                log(f"   - {r['Country Alpha-2']}: {r['Flags']}  [{r['Plans Captured']}]")
+
         # Write XLSX
         with pd.ExcelWriter(xlsx_out, engine="openpyxl") as w:
             df.to_excel(w, index=False)
+            checks_df.to_excel(w, index=False, sheet_name="Checks")
 
         log(
             f"\n🎉 Done! Saved {xlsx_out} | Rows: {len(df)} "
