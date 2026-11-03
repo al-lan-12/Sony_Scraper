@@ -93,7 +93,7 @@ _MULTILINGUAL_PLANS = [
     ("Duo", [r"\bduo\b"]),
     ("Student", [
         r"\bstudent", r"[ée]tudiant", r"\bestudiant", r"\bstudierende", r"\bopiskelija",
-        r"\bdiák", r"\begyetemista", r"\böğrenci", r"\bogrenci", r"φοιτητ", r"студент",
+        r"\bdiák", r"\begyetemista", r"\bhallgató", r"\böğrenci", r"\bogrenci", r"φοιτητ", r"студент",
         r"\bmwanafunzi", r"\bwanafunzi", r"\bmahasiswa", r"\bpelajar", r"sinh viên", r"\bestudante",
         r"\buniversitari", r"\bstudenck", r"\bstudentsk", r"学生", r"學生", r"학생", r"นักศึกษา",
         r"طالب", r"طلاب", r"סטודנט",
